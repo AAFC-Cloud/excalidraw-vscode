@@ -25,12 +25,25 @@ export function sceneFromEditor(
   const serialized = JSON.parse(
     serializeAsJSON(elements, appState, files, "local")
   );
+  const previousElements = new Map(
+    previous?.elements.map((element) => [element.id, element])
+  );
   return {
     ...previous,
     ...serialized,
+    appState: { ...previous?.appState, ...serialized.appState },
     source: previous?.source || serialized.source,
     // Tombstones are needed to merge a deletion made in another split pane.
-    elements: JSON.parse(JSON.stringify(elements)),
+    // Excalidraw import/normalization may omit extension fields it does not
+    // understand. Keep those fields while replacing properties the editor owns.
+    elements: JSON.parse(
+      JSON.stringify(
+        elements.map((element) => ({
+          ...previousElements.get(element.id),
+          ...element,
+        }))
+      )
+    ),
   };
 }
 

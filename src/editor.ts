@@ -4,17 +4,43 @@ import { Base64 } from "js-base64";
 
 import { ExcalidrawDocument } from "./document";
 import { SceneRenderer } from "./scene-renderer";
+import { EditorRecovery } from "./editor-recovery";
+import { EditorRecoveryRelay } from "./editor-recovery-relay";
+import type { SceneFile } from "./scene-file";
 import { languageMap } from "./lang";
 import { showEditor } from "./commands";
 
 export class ExcalidrawEditorProvider
-  implements vscode.CustomEditorProvider<ExcalidrawDocument>
+  implements vscode.CustomEditorProvider<ExcalidrawDocument>, vscode.Disposable
 {
+  private static readonly viewType = "editor.excalidraw";
+  private readonly hostId = `${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  private registration?: vscode.Disposable;
+  private restoreTimer?: ReturnType<typeof setTimeout>;
+  private relay?: EditorRecoveryRelay;
+  private readonly documents = new Set<ExcalidrawDocument>();
+  private readonly opening = new Set<string>();
+  private readonly panels = new Map<vscode.WebviewPanel, ExcalidrawEditor>();
+  private readonly recovering = new Set<ExcalidrawDocument>();
+  private readonly recovery: EditorRecovery;
+
   public static async register(
-    context: vscode.ExtensionContext
-  ): Promise<vscode.Disposable> {
-    const provider = new ExcalidrawEditorProvider(context);
-    const providerRegistration = vscode.window.registerCustomEditorProvider(
+    context: vscode.ExtensionContext,
+    sceneFile?: (uri: vscode.Uri) => Promise<SceneFile | undefined>,
+    output?: vscode.OutputChannel
+  ) {
+    // A new workbench has lazily restored tabs with no retained canvas yet.
+    // Only a second activation in the SAME workbench session needs the relay.
+    const sessionKey = `excalidraw.editorSession.${vscode.env.sessionId}`;
+    const reconnectRetained = context.workspaceState.get<boolean>(
+      sessionKey,
+      false
+    );
+    await context.workspaceState.update(sessionKey, true);
+    const provider = new ExcalidrawEditorProvider(context, sceneFile, output);
+    provider.registration = vscode.window.registerCustomEditorProvider(
       ExcalidrawEditorProvider.viewType,
       provider,
       {
@@ -22,10 +48,13 @@ export class ExcalidrawEditorProvider
         webviewOptions: { retainContextWhenHidden: true },
       }
     );
-
     ExcalidrawEditorProvider.migrateLegacyLibraryItems(context);
-
-    return providerRegistration;
+    // Let activation finish and normal hot-exit documents begin resolving first.
+    provider.restoreTimer = setTimeout(
+      () => void provider.restoreEditors(reconnectRetained),
+      500
+    );
+    return provider;
   }
 
   private static migrateLegacyLibraryItems(context: vscode.ExtensionContext) {
@@ -33,7 +62,7 @@ export class ExcalidrawEditorProvider
     if (!libraryItems) {
       return;
     }
-    context.globalState
+    void context.globalState
       .update(
         "library",
         JSON.stringify({
@@ -44,29 +73,216 @@ export class ExcalidrawEditorProvider
           libraryItems,
         })
       )
-      .then(() => {
-        context.globalState.update("libraryItems", undefined);
-      });
+      .then(() => context.globalState.update("libraryItems", undefined));
   }
 
-  private static readonly viewType = "editor.excalidraw";
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly sceneFile?: (
+      uri: vscode.Uri
+    ) => Promise<SceneFile | undefined>,
+    private readonly output?: vscode.OutputChannel
+  ) {
+    this.recovery = new EditorRecovery(context);
+  }
 
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  private async recoverRetainedEditors() {
+    const orphans = vscode.window.tabGroups.all
+      .flatMap((group) => group.tabs)
+      .filter(
+        (tab) =>
+          tab.input instanceof vscode.TabInputCustom &&
+          tab.input.viewType === ExcalidrawEditorProvider.viewType &&
+          tab.input.uri.scheme !== "excalidraw-recovery" &&
+          !this.opening.has(tab.input.uri.toString())
+      );
+    if (!orphans.length) {
+      return;
+    }
+    const targets = new Map<string, number>();
+    for (const tab of orphans) {
+      const uri = (tab.input as vscode.TabInputCustom).uri.toString();
+      targets.set(uri, (targets.get(uri) || 0) + 1);
+    }
+    const views = new Map(
+      [...targets.keys()].map((uri) => [
+        uri,
+        orphans
+          .filter(
+            (tab) => (tab.input as vscode.TabInputCustom).uri.toString() === uri
+          )
+          .map((tab) => ({
+            column: tab.group.viewColumn,
+            active: tab.isActive && tab.group.isActive,
+          })),
+      ])
+    );
+    const relay = new EditorRecoveryRelay(this.hostId, targets);
+    this.relay = relay;
+    try {
+      this.output?.appendLine(
+        "Recovering retained canvases after extension-host restart"
+      );
+      await vscode.commands.executeCommand(
+        "vscode.openWith",
+        relay.uri,
+        ExcalidrawEditorProvider.viewType,
+        { preserveFocus: true, preview: false }
+      );
+      const snapshots = await relay.snapshots;
+      // Capture ALL panes and publish the private journal before releasing ANY.
+      await this.recovery.capture(snapshots, (uri) => views.get(uri)!);
+      for (const uri of targets.keys()) {
+        const tabs = orphans.filter(
+          (tab) => (tab.input as vscode.TabInputCustom).uri.toString() === uri
+        );
+        // Revert-and-close captures the active input and performs a soft revert
+        // if its old provider is gone. The latest scene is already checkpointed;
+        // this clears ONLY the obsolete workbench model, never the user's file.
+        await vscode.commands.executeCommand(
+          "vscode.openWith",
+          vscode.Uri.parse(uri),
+          ExcalidrawEditorProvider.viewType,
+          { viewColumn: tabs[0].group.viewColumn, preview: false }
+        );
+        const active = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+        if (
+          !(active instanceof vscode.TabInputCustom) ||
+          active.viewType !== ExcalidrawEditorProvider.viewType ||
+          active.uri.toString() !== uri
+        ) {
+          throw new Error(
+            "The active editor changed during recovery; original tabs were left open."
+          );
+        }
+        await vscode.commands.executeCommand(
+          "workbench.action.revertAndCloseActiveEditor"
+        );
+        const remaining = orphans.filter(
+          (tab) =>
+            vscode.window.tabGroups.all.some((group) =>
+              group.tabs.includes(tab)
+            ) && (tab.input as vscode.TabInputCustom).uri.toString() === uri
+        );
+        if (
+          remaining.length &&
+          !(await vscode.window.tabGroups.close(remaining, true))
+        ) {
+          throw new Error(
+            "Could not release the old Excalidraw views; the recovery backup is retained."
+          );
+        }
+      }
+    } finally {
+      relay.dispose();
+      this.relay = undefined;
+    }
+  }
+
+  private async restoreEditors(reconnectRetained: boolean) {
+    try {
+      if (reconnectRetained) {
+        await this.recoverRetainedEditors();
+      }
+      for (const entry of [...this.recovery.pending]) {
+        for (const view of [...entry.views].sort(
+          (a, b) => (a.column || 1) - (b.column || 1)
+        )) {
+          if (
+            [...this.panels].some(
+              ([panel, editor]) =>
+                editor.document.uri.toString() === entry.uri &&
+                panel.viewColumn === view.column
+            )
+          ) {
+            continue;
+          }
+          await vscode.commands.executeCommand(
+            "vscode.openWith",
+            vscode.Uri.parse(entry.uri),
+            ExcalidrawEditorProvider.viewType,
+            {
+              viewColumn: view.column,
+              preserveFocus: true,
+              preview: false,
+            }
+          );
+        }
+        this.output?.appendLine(
+          `Restored editor after extension restart: ${entry.uri}`
+        );
+        // Keep the private recovery until save/revert/close. A failed renderer
+        // initialization must not consume the only durable copy of unsaved work.
+      }
+      const focused = this.recovery.pending.flatMap((entry) =>
+        entry.views
+          .filter((view) => view.active)
+          .map((view) => ({ uri: entry.uri, column: view.column }))
+      )[0];
+      if (focused) {
+        await vscode.commands.executeCommand(
+          "vscode.openWith",
+          vscode.Uri.parse(focused.uri),
+          ExcalidrawEditorProvider.viewType,
+          { viewColumn: focused.column, preserveFocus: false, preview: false }
+        );
+      }
+    } catch (error) {
+      this.output?.appendLine(
+        `Editor recovery failed; original canvases and any private backups retained: ${String(
+          error
+        )}`
+      );
+      void vscode.window.showErrorMessage(
+        `Excalidraw could not reconnect every drawing. Keep the original tabs open. ${String(
+          error
+        )}`
+      );
+    }
+  }
+
+  private async consumeRecovery(document: ExcalidrawDocument) {
+    const entry = this.recovery.find(document.uri);
+    if (entry) {
+      await this.recovery.consumed(entry);
+    }
+  }
+
+  dispose() {
+    if (this.restoreTimer) {
+      clearTimeout(this.restoreTimer);
+    }
+    this.relay?.dispose();
+    this.registration?.dispose();
+    for (const document of this.documents) {
+      document.dispose();
+    }
+    this._onDidChangeCustomDocument.dispose();
+  }
 
   public async resolveCustomEditor(
     document: ExcalidrawDocument,
     webviewPanel: vscode.WebviewPanel
   ) {
+    if (document.uri.toString() === this.relay?.uri.toString()) {
+      this.relay.attach(webviewPanel);
+      return;
+    }
     const editor = new ExcalidrawEditor(
       document,
       webviewPanel.webview,
-      this.context
+      this.context,
+      this.hostId
     );
+    this.panels.set(webviewPanel, editor);
     const editorDisposable = await editor.setupWebview();
-
     webviewPanel.onDidDispose(() => {
+      this.panels.delete(webviewPanel);
       editorDisposable.dispose();
     });
+    if (this.recovering.delete(document) && document.hasUnsavedChanges) {
+      this._onDidChangeCustomDocument.fire({ document });
+    }
   }
 
   private readonly _onDidChangeCustomDocument = new vscode.EventEmitter<
@@ -86,8 +302,21 @@ export class ExcalidrawEditorProvider
     uri: vscode.Uri,
     openContext: vscode.CustomDocumentOpenContext
   ): Promise<ExcalidrawDocument> {
+    if (uri.toString() === this.relay?.uri.toString()) {
+      return new ExcalidrawDocument(
+        uri,
+        new TextEncoder().encode(
+          JSON.stringify({ type: "excalidraw", elements: [] })
+        )
+      );
+    }
+    this.opening.add(uri.toString());
+    const sceneFile = await this.sceneFile?.(uri);
+    const recovered = this.recovery.find(uri);
     let content: Uint8Array;
-    if (openContext.backupId) {
+    if (recovered) {
+      content = await this.recovery.read(recovered, openContext.backupId);
+    } else if (openContext.backupId) {
       content = await vscode.workspace.fs.readFile(
         vscode.Uri.parse(openContext.backupId)
       );
@@ -95,39 +324,79 @@ export class ExcalidrawEditorProvider
       content = new TextEncoder().encode(
         JSON.stringify({ type: "excalidraw", elements: [] })
       );
+    } else if (sceneFile) {
+      content = new TextEncoder().encode(
+        JSON.stringify(await sceneFile.read())
+      );
     } else {
       content = await vscode.workspace.fs.readFile(uri);
     }
     const document = new ExcalidrawDocument(
       uri,
       content,
-      Boolean(openContext.backupId)
+      Boolean(recovered || openContext.backupId),
+      sceneFile
     );
-
-    const onDidDocumentChange = document.onDidContentChange(() => {
-      this._onDidChangeCustomDocument.fire({ document });
-    });
-
+    this.documents.add(document);
+    if (recovered) {
+      this.recovering.add(document);
+    }
+    const onDidDocumentChange = document.onDidContentChange(() =>
+      this._onDidChangeCustomDocument.fire({ document })
+    );
     document.onDidDispose(() => {
+      this.documents.delete(document);
+      this.opening.delete(uri.toString());
+      this.recovering.delete(document);
       onDidDocumentChange.dispose();
+      if (!document.hasUnsavedChanges) {
+        void this.consumeRecovery(document);
+      }
     });
-
+    if (sceneFile) {
+      this.output?.appendLine(
+        `Watching local drawing ${JSON.stringify(sceneFile.path)}`
+      );
+      const onDiskScene = document.onDidSceneChange((change) => {
+        if (change?.clientId === "disk") {
+          this.output?.appendLine(
+            `Applied external revision ${document.revision}: ${JSON.stringify(
+              sceneFile.path
+            )}`
+          );
+        }
+      });
+      document.onDidDispose(() => onDiskScene.dispose());
+    }
+    document.watchFile((error) => {
+      this.output?.appendLine(
+        `File synchronization failed for ${JSON.stringify(uri.fsPath)}: ${
+          error.message
+        }`
+      );
+      void vscode.window.showWarningMessage(
+        `Excalidraw file synchronization: ${error.message}`
+      );
+    });
     return document;
   }
 
-  revertCustomDocument(document: ExcalidrawDocument): Thenable<void> {
-    return document.revert();
+  async revertCustomDocument(document: ExcalidrawDocument) {
+    await document.revert();
+    await this.consumeRecovery(document);
   }
 
-  saveCustomDocument(document: ExcalidrawDocument): Thenable<void> {
-    return document.save();
+  async saveCustomDocument(document: ExcalidrawDocument) {
+    await document.save();
+    await this.consumeRecovery(document);
   }
 
   async saveCustomDocumentAs(
     document: ExcalidrawDocument,
     destination: vscode.Uri
   ) {
-    await document.saveAs(destination);
+    await document.saveAs(destination, await this.sceneFile?.(destination));
+    await this.consumeRecovery(document);
   }
 }
 
@@ -141,11 +410,11 @@ export class ExcalidrawEditor {
   }>();
   private static onLibraryImport = ExcalidrawEditor._onLibraryImport.event;
   private textDecoder = new TextDecoder();
-
   constructor(
     readonly document: ExcalidrawDocument,
     readonly webview: vscode.Webview,
-    readonly context: vscode.ExtensionContext
+    readonly context: vscode.ExtensionContext,
+    private readonly hostId: string
   ) {}
 
   isViewOnly() {
@@ -176,6 +445,7 @@ export class ExcalidrawEditor {
         documentId: this.document.documentId,
         revision: this.document.revision,
         sequence: this.document.sequenceFor(clientId),
+        ...this.document.recoveryMetadata(),
       });
     const sendScene = (sourceClientId: string, sequence: number) =>
       this.webview.postMessage({
@@ -185,6 +455,7 @@ export class ExcalidrawEditor {
         revision: this.document.revision,
         clientId: sourceClientId,
         sequence,
+        ...this.document.recoveryMetadata(),
       });
     const onDidSceneChange = this.document.onDidSceneChange((change) => {
       if (!clientId) {
@@ -217,6 +488,9 @@ export class ExcalidrawEditor {
               this.document.loaded(msg.documentId, msg.scene);
               renderer.loaded();
             }
+            break;
+          case "heartbeat":
+            await this.webview.postMessage({ type: "heartbeat" });
             break;
           case "change":
             if (this.isViewOnly()) {
@@ -342,6 +616,9 @@ export class ExcalidrawEditor {
     );
 
     this.webview.html = await this.buildHtmlForWebview({
+      uri: this.document.uri.toString(),
+      hostId: this.hostId,
+      sessionId: vscode.env.sessionId,
       contentType: this.document.contentType,
       library: await this.loadLibrary(libraryUri),
       viewModeEnabled: this.isViewOnly() || undefined,

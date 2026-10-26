@@ -3,10 +3,10 @@
     "icon": "assets/logo.png",
     "displayName": "Excalidraw",
     "description": "Draw schemas in VS Code using Excalidraw",
-    "version": "3.9.3",
+    "version": "3.9.6",
     "publisher": "pomdtr",
     "engines": {
-        "vscode": "^1.63.0"
+        "vscode": "^1.74.0"
     },
     "categories": [
         "Visualization"
@@ -24,13 +24,18 @@
         "url": "https://github.com/pomdtr"
     },
     "activationEvents": [
-        "workspaceContains:**/*.{excalidraw,excalidraw.svg,excalidraw.png}"
+        "workspaceContains:**/*.{excalidraw,excalidraw.svg,excalidraw.png}",
+        "onStartupFinished"
     ],
     "repository": {
         "type": "git",
         "url": "https://github.com/excalidraw/excalidraw-vscode"
     },
     "browser": "./dist/extension.js",
+    "main": "./dist/desktop-extension.js",
+    "extensionKind": [
+        "workspace"
+    ],
     "contributes": {
         "commands": [
             {
@@ -372,7 +377,8 @@
         "lint": "eslint --ext .ts src",
         "prettier": "prettier --check .",
         "prettierfix": "prettier --write .",
-        "open-in-browser": "vscode-test-web --headless --extensionDevelopmentPath=. ./examples"
+        "open-in-browser": "vscode-test-web --headless --extensionDevelopmentPath=. ./examples",
+        "test:native": "node test/native-lifecycle-smoke.cjs"
     },
     "capabilities": {
         "untrustedWorkspaces": {

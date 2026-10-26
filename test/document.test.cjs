@@ -21,6 +21,9 @@ function compile(relativePath, imports) {
   return compiled.exports;
 }
 const sceneModule = compile("../src/scene.ts", {});
+const fileMerge = compile("../src/scene-file-merge.ts", {
+  "./scene": sceneModule,
+});
 
 class Disposable {
   constructor(dispose) {
@@ -72,7 +75,8 @@ function scene(x = 0) {
 }
 function fixture(
   extension = "excalidraw",
-  originalContent = bytes("original")
+  originalContent = bytes("original"),
+  sceneFile
 ) {
   const writes = [];
   const filesystem = {
@@ -86,16 +90,20 @@ function fixture(
   const { ExcalidrawDocument } = compile("../src/document.ts", {
     vscode,
     "./scene": sceneModule,
+    "./scene-file-merge": fileMerge,
   });
   const document = new ExcalidrawDocument(
     uri(`drawing.${extension}`),
-    originalContent
+    originalContent,
+    false,
+    sceneFile
   );
   return {
     document,
     filesystem,
     writes,
-    restore: (content) => new ExcalidrawDocument(document.uri, content, true),
+    restore: (content) =>
+      new ExcalidrawDocument(document.uri, content, true, sceneFile),
   };
 }
 function update(
@@ -397,4 +405,178 @@ test("initial renderer normalization stays clean and a delayed pane load cannot 
   assert.equal(dirty, 1);
   await document.save();
   assert.equal(decode(writes[0].content).elements[0].x, 40);
+});
+
+function sharedFixture(initial = scene()) {
+  let disk = structuredClone(initial);
+  let writes = 0;
+  const file = {
+    path: "drawing.excalidraw",
+    read: async () => structuredClone(disk),
+    update: async (change) => {
+      const next = change(structuredClone(disk));
+      disk = structuredClone(next);
+      writes++;
+      return next;
+    },
+    watch: () => ({ dispose() {} }),
+  };
+  return {
+    ...fixture("excalidraw", bytes(JSON.stringify(initial)), file),
+    file,
+    disk: () => disk,
+    replace: (next) => {
+      disk = structuredClone(next);
+    },
+    writeCount: () => writes,
+  };
+}
+
+test("external changes refresh a clean document without dirtying and stale normalization cannot replace them", async () => {
+  const { document, replace } = sharedFixture();
+  let dirty = 0;
+  const changes = [];
+  document.onDidContentChange(() => dirty++);
+  document.onDidSceneChange((value) => changes.push(value));
+  const normalized = scene();
+  normalized.elements[0].index = "a0";
+  document.loaded(document.documentId, normalized);
+  replace(scene(90));
+  await document.refreshFromDisk();
+  assert.equal(document.scene.elements[0].x, 90);
+  assert.equal(dirty, 0);
+  assert.deepEqual(changes, [{ clientId: "disk", sequence: 0 }]);
+  document.loaded(document.documentId, normalized);
+  assert.equal(document.scene.elements[0].x, 90);
+});
+
+test("external label changes merge with an unsaved position and are retained by save", async () => {
+  const initial = scene();
+  initial.elements[0].text = "before";
+  const { document, replace, disk } = sharedFixture(initial);
+  const moved = structuredClone(initial);
+  moved.elements[0].x = 50;
+  update(document, 1, initial, moved);
+  const external = structuredClone(initial);
+  external.elements[0].text = "after";
+  external.elements[0].version = 3;
+  replace(external);
+  await document.refreshFromDisk();
+  assert.equal(document.scene.elements[0].x, 50);
+  assert.equal(document.scene.elements[0].text, "after");
+  await document.save();
+  assert.equal(disk().elements[0].x, 50);
+  assert.equal(disk().elements[0].text, "after");
+});
+
+test("a conflicting external edit leaves both versions intact and blocks ordinary save", async () => {
+  const { document, replace, disk, writeCount } = sharedFixture();
+  update(document, 1, scene(), scene(40));
+  replace(scene(70));
+  await assert.rejects(
+    document.refreshFromDisk(),
+    /conflict.*elements\[box\]\.x/
+  );
+  await assert.rejects(document.save(), /Neither version was overwritten/);
+  assert.equal(document.scene.elements[0].x, 40);
+  assert.equal(disk().elements[0].x, 70);
+  assert.equal(writeCount(), 0);
+  await document.revert();
+  document.loaded(document.documentId, scene(70));
+  assert.equal(document.scene.elements[0].x, 70);
+});
+
+test("backup retains the disk baseline so recovered local edits merge with later external changes", async () => {
+  const initial = scene();
+  initial.elements[0].text = "before";
+  const { document, writes, restore, replace, disk } = sharedFixture(initial);
+  const moved = structuredClone(initial);
+  moved.elements[0].x = 25;
+  update(document, 1, initial, moved);
+  await document.backup(uri("backup"));
+  const recovered = restore(writes[0].content);
+  const external = structuredClone(initial);
+  external.elements[0].text = "after";
+  replace(external);
+  await recovered.refreshFromDisk();
+  await recovered.save();
+  assert.equal(disk().elements[0].x, 25);
+  assert.equal(disk().elements[0].text, "after");
+});
+
+test("a clean externally removed element stays deleted despite renderer normalization", async () => {
+  const { document, replace, disk } = sharedFixture();
+  const normalized = scene();
+  normalized.elements[0].index = "a0";
+  document.loaded(document.documentId, normalized);
+  replace({ ...scene(), elements: [] });
+  await document.refreshFromDisk();
+  await document.save();
+  assert.equal(
+    disk().elements.filter((element) => !element.isDeleted).length,
+    0
+  );
+});
+
+test("malformed or unavailable external content preserves the last accepted scene", async () => {
+  const { document, file } = sharedFixture();
+  update(document, 1, scene(), scene(40));
+  file.read = async () => {
+    throw new Error("Malformed file");
+  };
+  await assert.rejects(document.refreshFromDisk(), /Malformed file/);
+  assert.equal(document.scene.elements[0].x, 40);
+});
+
+test("an edit arriving during atomic publication is saved before the document reports success", async () => {
+  const { document, file, disk } = sharedFixture();
+  const original = file.update;
+  const started = deferred();
+  const release = deferred();
+  let count = 0;
+  file.update = async (change) => {
+    const saved = await original(change);
+    if (++count === 1) {
+      started.resolve();
+      await release.promise;
+    }
+    return saved;
+  };
+  const saving = document.save();
+  await started.promise;
+  update(document, 1, scene(), scene(80));
+  release.resolve();
+  await saving;
+  assert.equal(count, 2);
+  assert.equal(disk().elements[0].x, 80);
+});
+
+test("a same-field edit arriving while the externally changed version is being saved reports a conflict", async () => {
+  const { document, file, replace, disk } = sharedFixture();
+  replace(scene(70));
+  const original = file.update;
+  const started = deferred();
+  const release = deferred();
+  file.update = async (change) => {
+    const saved = await original(change);
+    started.resolve();
+    await release.promise;
+    return saved;
+  };
+  const saving = document.save();
+  await started.promise;
+  update(document, 1, scene(), scene(80));
+  release.resolve();
+  await assert.rejects(saving, /conflict/);
+  assert.equal(document.scene.elements[0].x, 80);
+  assert.equal(disk().elements[0].x, 70);
+});
+
+test("legacy backup without a disk baseline preserves recovered edits and requires explicit recovery", async () => {
+  const { restore, disk } = sharedFixture();
+  const recovered = restore(bytes(JSON.stringify(scene(75))));
+  await assert.rejects(recovered.refreshFromDisk(), /no disk baseline/);
+  await assert.rejects(recovered.save(), /no disk baseline/);
+  assert.equal(recovered.scene.elements[0].x, 75);
+  assert.equal(disk().elements[0].x, 0);
 });

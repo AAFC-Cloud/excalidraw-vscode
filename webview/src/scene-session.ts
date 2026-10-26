@@ -1,5 +1,6 @@
 import { mergeSceneChange, sceneEqual } from "../../src/scene";
 import type { SceneData } from "../../src/scene";
+import type { EditorRecoveryState } from "../../src/editor-recovery-state";
 
 export interface SceneUpdate {
   scene: SceneData;
@@ -7,6 +8,9 @@ export interface SceneUpdate {
   revision: number;
   clientId?: string;
   sequence?: number;
+  diskBase?: SceneData;
+  dirty?: boolean;
+  sequences?: [string, number][];
 }
 
 export interface PendingSceneChange {
@@ -27,6 +31,9 @@ export class SceneSession {
   private state: SceneSessionState;
   private revision = -1;
   private authoritative?: SceneData;
+  private diskBase?: SceneData;
+  private dirty = false;
+  private sequences: [string, number][] = [];
   public scene?: SceneData;
 
   constructor(
@@ -50,7 +57,11 @@ export class SceneSession {
     scene: SceneData,
     documentId: string,
     revision: number,
-    acceptedSequence: number
+    acceptedSequence: number,
+    diskBase?: SceneData,
+    dirty = false,
+    sequences: [string, number][] = [],
+    authoritativeScene = scene
   ) {
     if (this.state.documentId !== documentId) {
       this.state.pending = [];
@@ -62,7 +73,10 @@ export class SceneSession {
       (change) => change.sequence > acceptedSequence
     );
     this.revision = revision;
-    this.authoritative = scene;
+    this.authoritative = authoritativeScene;
+    this.diskBase = diskBase;
+    this.dirty = dirty;
+    this.sequences = sequences;
     this.rebase();
     this.persist(this.state);
     // This initializes image documents without marking them dirty. JSON documents
@@ -109,17 +123,39 @@ export class SceneSession {
     this.send(change);
   }
 
-  /** Release accepted snapshots without replacing an in-progress canvas gesture. */
+  /** Keep the host snapshot current without rebasing an in-progress gesture. */
   acknowledge(message: SceneUpdate) {
-    if (
-      message.documentId !== this.state.documentId ||
-      message.clientId !== this.state.clientId
-    )
-      return;
-    this.state.pending = this.state.pending.filter(
-      (change) => change.sequence > (message.sequence || 0)
-    );
+    if (message.documentId !== this.state.documentId) return;
+    if (message.revision >= this.revision) {
+      this.authoritative = message.scene;
+      this.revision = message.revision;
+      this.diskBase = message.diskBase;
+      this.dirty = message.dirty ?? this.dirty;
+      this.sequences = message.sequences ?? this.sequences;
+    }
+    if (message.clientId === this.state.clientId) {
+      this.state.pending = this.state.pending.filter(
+        (change) => change.sequence > (message.sequence || 0)
+      );
+    }
     this.persist(this.state);
+  }
+
+  /** Retain the host baseline and pending edits separately for restart merging. */
+  recovery(uri: string): EditorRecoveryState | undefined {
+    if (!this.authoritative || !this.state.documentId) return undefined;
+    return {
+      uri,
+      clientId: this.state.clientId,
+      documentId: this.state.documentId,
+      sequence: this.state.sequence,
+      revision: this.revision,
+      scene: this.authoritative,
+      pending: this.state.pending,
+      diskBase: this.diskBase,
+      dirty: this.dirty,
+      sequences: this.sequences,
+    };
   }
   receive(message: SceneUpdate) {
     if (message.documentId !== this.state.documentId) {
@@ -127,10 +163,6 @@ export class SceneSession {
     }
     this.acknowledge(message);
 
-    if (message.revision >= this.revision) {
-      this.authoritative = message.scene;
-      this.revision = message.revision;
-    }
     const previous = this.scene;
     this.rebase();
     this.persist(this.state);

@@ -52,4 +52,13 @@ const config = {
   },
 };
 
-module.exports = config;
+module.exports = [
+  config,
+  {
+    ...config,
+    name: "desktop",
+    target: "node",
+    entry: "./src/desktop-extension.ts",
+    output: { ...config.output, filename: "desktop-extension.js" },
+  },
+];

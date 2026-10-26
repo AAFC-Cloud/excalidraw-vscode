@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { mergeSceneChange, sceneEqual, SceneData } from "./scene";
+import type { SceneFile } from "./scene-file";
+import { mergeSceneFile, parseSceneFile } from "./scene-file-merge";
 
 /** Shared scene and persistence lifecycle for all views of one resource. */
 export class ExcalidrawDocument implements vscode.CustomDocument {
@@ -15,6 +17,23 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
     (scene: SceneData, contentType: string) => Promise<Uint8Array>
   >();
   private writes: Promise<void> = Promise.resolve();
+  private diskBase?: SceneData;
+  private watcher?: { dispose(): void };
+  private disposed = false;
+  private pendingLocalChanges = false;
+
+  /** Used to reinstate VS Code dirty state after an extension-host handoff. */
+  public get hasUnsavedChanges() {
+    return this.pendingLocalChanges;
+  }
+
+  public recoveryMetadata() {
+    return {
+      diskBase: this.diskBase,
+      dirty: this.pendingLocalChanges,
+      sequences: [...this.sequences],
+    };
+  }
 
   private readonly _onDidContentChange = new vscode.EventEmitter<void>();
   public readonly onDidContentChange = this._onDidContentChange.event;
@@ -32,8 +51,10 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
   constructor(
     public readonly uri: vscode.Uri,
     public content: Uint8Array,
-    fromBackup = false
+    fromBackup = false,
+    private readonly sceneFile?: SceneFile
   ) {
+    this.pendingLocalChanges = fromBackup;
     switch (path.parse(uri.fsPath).ext) {
       case ".svg":
         this.contentType = "image/svg+xml";
@@ -62,6 +83,8 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
         this.sequences.set(clientId, sequence);
       }
       this.scene = data.scene;
+      this.diskBase = data.diskBase;
+      this.pendingLocalChanges = data.pendingLocalChanges ?? true;
       this.content = data.scene
         ? new TextEncoder().encode(JSON.stringify(data.scene))
         : new Uint8Array(data.content);
@@ -73,11 +96,75 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
         appState: data.appState || {},
         files: data.files || {},
       };
+      if (!fromBackup) {
+        this.diskBase = this.scene;
+      }
     }
   }
 
   private newDocumentId() {
     return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  /** Follow atomic replacements without turning clean external updates into edits. */
+  public watchFile(report: (error: Error) => void) {
+    if (!this.sceneFile || this.watcher) {
+      return;
+    }
+    let lastError: string | undefined;
+    let refreshing = false;
+    const refresh = () => {
+      if (refreshing || this.disposed) {
+        return;
+      }
+      refreshing = true;
+      void this.refreshFromDisk().then(
+        () => {
+          lastError = undefined;
+          refreshing = false;
+        },
+        (error: unknown) => {
+          refreshing = false;
+          const failure =
+            error instanceof Error ? error : new Error(String(error));
+          if (!this.disposed && lastError !== failure.message) {
+            report(failure);
+          }
+          lastError = failure.message;
+        }
+      );
+    };
+    this.watcher = this.sceneFile.watch(refresh, report);
+    refresh();
+  }
+
+  public async refreshFromDisk() {
+    await this.enqueueWrite(async () => {
+      if (!this.sceneFile || this.disposed) {
+        return;
+      }
+      const disk = await this.sceneFile.read();
+      if (this.disposed || sceneEqual(this.diskBase, disk)) {
+        return;
+      }
+      const merged =
+        this.scene && this.pendingLocalChanges
+          ? mergeSceneFile(this.diskBase, this.scene, disk)
+          : disk;
+      this.acceptDisk(disk, merged);
+    });
+  }
+
+  private acceptDisk(disk: SceneData, merged: SceneData) {
+    this.diskBase = disk;
+    this.content = new TextEncoder().encode(JSON.stringify(disk));
+    if (!sceneEqual(this.scene, merged)) {
+      this.scene = merged;
+      this.revision++;
+      // A scene message preserves the canvas's viewport and active gesture.
+      // init/revert would recreate the entire renderer and drop those controls.
+      this._onDidSceneChange.fire({ clientId: "disk", sequence: 0 });
+    }
   }
 
   public sequenceFor(clientId: string) {
@@ -86,7 +173,11 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
 
   /** Decoding the original image/JSON does not itself constitute a user edit. */
   public loaded(documentId: string, scene: SceneData) {
-    if (documentId === this.documentId && this.sequences.size === 0) {
+    if (
+      documentId === this.documentId &&
+      this.sequences.size === 0 &&
+      this.revision === 0
+    ) {
       this.scene = scene;
     }
   }
@@ -110,6 +201,7 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
     this.scene = merged;
     if (!sceneEqual(current, merged)) {
       this.revision++;
+      this.pendingLocalChanges = true;
       this._onDidContentChange.fire();
     }
     // Acknowledge even a no-op. A recreated webview may replay an edit whose
@@ -129,7 +221,12 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
     // Order the read after outstanding saves, so a late image export cannot
     // overwrite the file after all canvases have reverted to an older version.
     await this.enqueueWrite(async () => {
-      const content = await vscode.workspace.fs.readFile(this.uri);
+      const disk = this.sceneFile ? await this.sceneFile.read() : undefined;
+      const content = disk
+        ? new TextEncoder().encode(JSON.stringify(disk))
+        : await vscode.workspace.fs.readFile(this.uri);
+      this.diskBase = disk;
+      this.pendingLocalChanges = false;
       this.content = content;
       this.scene = undefined;
       this.revision = 0;
@@ -151,6 +248,8 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
         revision: this.revision,
         sequences: [...this.sequences],
         scene: this.scene,
+        diskBase: this.diskBase,
+        pendingLocalChanges: this.pendingLocalChanges,
         content: this.scene ? undefined : Array.from(this.content),
       })
     );
@@ -170,11 +269,20 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
   }
 
   async save() {
-    await this.saveAs(this.uri);
+    await this.saveAs(this.uri, this.sceneFile);
   }
 
-  async saveAs(destination: vscode.Uri) {
+  async saveAs(destination: vscode.Uri, sceneFile?: SceneFile) {
     await this.enqueueWrite(async () => {
+      if (sceneFile) {
+        this.scene ||= parseSceneFile(this.content);
+        await this.saveLocalScene(sceneFile);
+        if (destination.toString() === this.uri.toString()) {
+          this.revision++;
+          this._onDidSceneChange.fire({ clientId: "saved", sequence: 0 });
+        }
+        return;
+      }
       // VS Code clears a content-change provider's dirty flag when save resolves.
       // An edit during asynchronous encoding/writing therefore has to be saved
       // too; otherwise a newer canvas would appear clean despite older disk data.
@@ -187,10 +295,58 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
         }
         await vscode.workspace.fs.writeFile(destination, content);
         if (revision === this.revision) {
+          if (destination.toString() === this.uri.toString()) {
+            this.pendingLocalChanges = false;
+            this.diskBase = scene;
+            this.revision++;
+            this._onDidSceneChange.fire({ clientId: "saved", sequence: 0 });
+          }
           return;
         }
       }
     });
+  }
+
+  private async saveLocalScene(file: SceneFile) {
+    const sameFile = file.path === this.sceneFile?.path;
+    while (true) {
+      let captured = this.scene!;
+      let revision = this.revision;
+      const saved = await file.update((disk) => {
+        // Capture after acquiring the lock; edits can arrive while waiting.
+        captured = this.scene!;
+        revision = this.revision;
+        if (!sameFile) {
+          return captured;
+        }
+        // Renderer normalization is not a user edit. A clean external revision
+        // wins over those defaults, including externally removed elements.
+        if (
+          !this.pendingLocalChanges &&
+          this.diskBase &&
+          disk &&
+          !sceneEqual(this.diskBase, disk)
+        ) {
+          return disk;
+        }
+        return mergeSceneFile(this.diskBase, captured, disk);
+      });
+      if (sameFile) {
+        const merged = mergeSceneFile(captured, this.scene!, saved);
+        this.acceptDisk(saved, merged);
+      }
+      // acceptDisk can increment the scene revision for an external contribution.
+      // Only edits arriving while writing require another publication.
+      if (sceneEqual(this.scene, sameFile ? saved : captured)) {
+        if (sameFile) {
+          this.pendingLocalChanges = false;
+        }
+        return;
+      }
+      if (!sameFile && revision === this.revision) {
+        return;
+      }
+    }
   }
 
   private async serialize(scene: SceneData): Promise<Uint8Array> {
@@ -226,6 +382,8 @@ export class ExcalidrawDocument implements vscode.CustomDocument {
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.watcher?.dispose();
     this._onDidDispose.fire();
     this._onDidDispose.dispose();
     this._onDidContentChange.dispose();

@@ -162,3 +162,82 @@ test("gesture acknowledgements release snapshots without rebasing the active sce
   assert.equal(pane.controller.scene.elements[0].x, 200);
   assert.equal(pane.state().pending.length, 1);
 });
+
+test("recovery retains the latest host baseline while a gesture defers rendering", () => {
+  const pane = session();
+  const disk = scene();
+  pane.controller.initialize(disk, "document", 0, 0, disk, false, []);
+  pane.controller.change(scene(100));
+  const host = scene(0, "red");
+  pane.controller.acknowledge({
+    scene: host,
+    documentId: "document",
+    revision: 1,
+    clientId: "another-pane",
+    sequence: 2,
+    diskBase: disk,
+    dirty: true,
+    sequences: [["another-pane", 2]],
+  });
+  const recovery = pane.controller.recovery("file:///drawing.excalidraw");
+  assert.equal(
+    pane.controller.scene.elements[0].color,
+    "black",
+    "Active gesture was not rebased"
+  );
+  assert.deepEqual(
+    recovery.scene,
+    host,
+    "Recovery uses host state before pending edits"
+  );
+  assert.deepEqual(
+    recovery.pending.map((edit) => edit.sequence),
+    [1]
+  );
+  assert.deepEqual(recovery.sequences, [["another-pane", 2]]);
+  assert.equal(recovery.dirty, true);
+  assert.deepEqual(recovery.diskBase, disk);
+  assert.equal(recovery.revision, 1);
+});
+
+test("recovery captures acknowledged edits and save metadata without replaying them", () => {
+  const pane = session();
+  pane.controller.initialize(scene(), "document", 0, 0, scene(), false);
+  pane.controller.change(scene(100));
+  pane.controller.acknowledge({
+    scene: scene(100),
+    documentId: "document",
+    revision: 1,
+    clientId: "pane",
+    sequence: 1,
+    diskBase: scene(),
+    dirty: true,
+    sequences: [["pane", 1]],
+  });
+  pane.controller.acknowledge({
+    scene: scene(100),
+    documentId: "document",
+    revision: 1,
+    clientId: "disk",
+    sequence: 0,
+    diskBase: scene(100),
+    dirty: false,
+    sequences: [["pane", 1]],
+  });
+  pane.controller.acknowledge({
+    scene: scene(),
+    documentId: "document",
+    revision: 0,
+    clientId: "another-pane",
+    sequence: 0,
+    diskBase: scene(),
+    dirty: true,
+    sequences: [],
+  });
+  const recovery = pane.controller.recovery("file:///drawing.excalidraw");
+  assert.equal(recovery.pending.length, 0);
+  assert.equal(recovery.scene.elements[0].x, 100);
+  assert.equal(recovery.diskBase.elements[0].x, 100);
+  assert.equal(recovery.dirty, false);
+  assert.deepEqual(recovery.sequences, [["pane", 1]]);
+});
