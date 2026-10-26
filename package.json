@@ -367,6 +367,8 @@
         "build": "npm run build-webview && webpack --mode development",
         "package": "npm run build-webview && webpack --mode production --devtool hidden-source-map",
         "vscode:prepublish": "npm run package",
+        "test": "node --test test/*.test.cjs",
+        "test:browser": "node test/browser-smoke.cjs",
         "lint": "eslint --ext .ts src",
         "prettier": "prettier --check .",
         "prettierfix": "prettier --write .",

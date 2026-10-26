@@ -3,6 +3,7 @@ import * as path from "path";
 import { Base64 } from "js-base64";
 
 import { ExcalidrawDocument } from "./document";
+import { SceneRenderer } from "./scene-renderer";
 import { languageMap } from "./lang";
 import { showEditor } from "./commands";
 
@@ -17,7 +18,7 @@ export class ExcalidrawEditorProvider
       ExcalidrawEditorProvider.viewType,
       provider,
       {
-        supportsMultipleEditorsPerDocument: false,
+        supportsMultipleEditorsPerDocument: true,
         webviewOptions: { retainContextWhenHidden: true },
       }
     );
@@ -81,22 +82,27 @@ export class ExcalidrawEditorProvider
     return document.backup(context.destination);
   }
 
-  // TODO: Backup Support
   async openCustomDocument(
     uri: vscode.Uri,
     openContext: vscode.CustomDocumentOpenContext
   ): Promise<ExcalidrawDocument> {
     let content: Uint8Array;
-    if (uri.scheme === "untitled") {
+    if (openContext.backupId) {
+      content = await vscode.workspace.fs.readFile(
+        vscode.Uri.parse(openContext.backupId)
+      );
+    } else if (uri.scheme === "untitled") {
       content = new TextEncoder().encode(
         JSON.stringify({ type: "excalidraw", elements: [] })
       );
     } else {
-      content = await vscode.workspace.fs.readFile(
-        openContext.backupId ? vscode.Uri.parse(openContext.backupId) : uri
-      );
+      content = await vscode.workspace.fs.readFile(uri);
     }
-    const document = new ExcalidrawDocument(uri, content);
+    const document = new ExcalidrawDocument(
+      uri,
+      content,
+      Boolean(openContext.backupId)
+    );
 
     const onDidDocumentChange = document.onDidContentChange(() => {
       this._onDidChangeCustomDocument.fire({ document });
@@ -156,6 +162,41 @@ export class ExcalidrawEditor {
       enableScripts: true,
     };
 
+    const renderer = new SceneRenderer(this.webview);
+    const serializer = this.document.registerSerializer((scene, contentType) =>
+      renderer.serialize(scene, contentType)
+    );
+    let clientId = "";
+    const initialize = () =>
+      this.webview.postMessage({
+        type: "init",
+        content: Array.from(this.document.content),
+        contentType: this.document.contentType,
+        scene: this.document.scene,
+        documentId: this.document.documentId,
+        revision: this.document.revision,
+        sequence: this.document.sequenceFor(clientId),
+      });
+    const sendScene = (sourceClientId: string, sequence: number) =>
+      this.webview.postMessage({
+        type: "scene",
+        scene: this.document.scene,
+        documentId: this.document.documentId,
+        revision: this.document.revision,
+        clientId: sourceClientId,
+        sequence,
+      });
+    const onDidSceneChange = this.document.onDidSceneChange((change) => {
+      if (!clientId) {
+        return;
+      }
+      if (change) {
+        void sendScene(change.clientId, change.sequence);
+      } else {
+        void initialize();
+      }
+    });
+
     let libraryUri = await this.getLibraryUri();
 
     const onDidReceiveMessage = this.webview.onDidReceiveMessage(
@@ -166,8 +207,52 @@ export class ExcalidrawEditor {
             await this.saveLibrary(library, libraryUri);
             ExcalidrawEditor._onDidChangeLibrary.fire(library);
             break;
+          case "ready":
+            clientId = msg.clientId;
+            renderer.restarted();
+            await initialize();
+            break;
+          case "loaded":
+            if (msg.documentId === this.document.documentId) {
+              this.document.loaded(msg.documentId, msg.scene);
+              renderer.loaded();
+            }
+            break;
           case "change":
-            await this.document.update(new Uint8Array(msg.content));
+            if (this.isViewOnly()) {
+              break;
+            }
+            if (
+              !this.document.update(
+                msg.clientId,
+                msg.documentId,
+                msg.sequence,
+                msg.before,
+                msg.scene
+              )
+            ) {
+              if (msg.documentId !== this.document.documentId) {
+                await initialize();
+              } else {
+                await sendScene(
+                  msg.clientId,
+                  this.document.sequenceFor(msg.clientId)
+                );
+              }
+            }
+            break;
+          case "save":
+            if (!this.isViewOnly()) {
+              await vscode.commands.executeCommand(
+                "workbench.action.files.save"
+              );
+            }
+            break;
+          case "serialized":
+            renderer.finish(msg.requestId, msg.content);
+            break;
+          case "serialization-error":
+            renderer.finish(msg.requestId, undefined, msg.error);
             break;
           case "link-open":
             await openLink(vscode.Uri.parse(msg.url), this.document.uri);
@@ -194,15 +279,16 @@ export class ExcalidrawEditor {
         });
       }, this);
 
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (!e.affectsConfiguration("excalidraw.language", this.document.uri)) {
-        return;
-      }
-      this.webview.postMessage({
-        type: "language-change",
-        langCode: this.getLanguage(),
-      });
-    }, this);
+    const onDidChangeLanguageConfiguration =
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (!e.affectsConfiguration("excalidraw.language", this.document.uri)) {
+          return;
+        }
+        this.webview.postMessage({
+          type: "language-change",
+          langCode: this.getLanguage(),
+        });
+      }, this);
 
     const onDidChangeEmbedConfiguration =
       vscode.workspace.onDidChangeConfiguration((e) => {
@@ -256,7 +342,6 @@ export class ExcalidrawEditor {
     );
 
     this.webview.html = await this.buildHtmlForWebview({
-      content: Array.from(this.document.content),
       contentType: this.document.contentType,
       library: await this.loadLibrary(libraryUri),
       viewModeEnabled: this.isViewOnly() || undefined,
@@ -268,6 +353,10 @@ export class ExcalidrawEditor {
 
     return new vscode.Disposable(() => {
       onDidReceiveMessage.dispose();
+      onDidSceneChange.dispose();
+      onDidChangeLanguageConfiguration.dispose();
+      serializer.dispose();
+      renderer.dispose();
       onDidChangeThemeConfiguration.dispose();
       onLibraryImport.dispose();
       onDidChangeLibraryConfiguration.dispose();

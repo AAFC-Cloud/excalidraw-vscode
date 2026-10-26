@@ -17,6 +17,7 @@ import {
   LibraryItems,
 } from "@excalidraw/excalidraw/types";
 import { vscode } from "./vscode.ts";
+import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 
 function detectTheme() {
   switch (document.body.className) {
@@ -29,29 +30,26 @@ function detectTheme() {
   }
 }
 
+function resolveTheme(themeConfig: string) {
+  switch (themeConfig) {
+    case "dark":
+      return THEME.DARK;
+    case "auto":
+      return detectTheme();
+    default:
+      return THEME.LIGHT;
+  }
+}
+
 function useTheme(initialThemeConfig: string) {
   const [themeConfig, setThemeConfig] = useState(initialThemeConfig);
-  const getExcalidrawTheme = () => {
-    switch (themeConfig) {
-      case "light":
-        return THEME.LIGHT;
-      case "dark":
-        return THEME.DARK;
-      case "auto":
-        return detectTheme();
-    }
-  };
-  const [theme, setTheme] = useState(getExcalidrawTheme());
-  const updateTheme = () => {
-    setTheme(getExcalidrawTheme());
-  };
-
-  useEffect(updateTheme, [themeConfig]);
+  const [theme, setTheme] = useState(() => resolveTheme(initialThemeConfig));
 
   useEffect(() => {
+    setTheme(resolveTheme(themeConfig));
     if (themeConfig !== "auto") return;
     const observer = new MutationObserver(() => {
-      updateTheme();
+      setTheme(detectTheme());
     });
     observer.observe(document.body, {
       attributes: true,
@@ -64,7 +62,6 @@ function useTheme(initialThemeConfig: string) {
 
   return { theme, setThemeConfig };
 }
-
 export default function App(props: {
   initialData?: ExcalidrawInitialDataState;
   name: string;
@@ -72,38 +69,26 @@ export default function App(props: {
   langCode: string;
   viewModeEnabled: boolean;
   libraryItems?: LibraryItems;
-  imageParams: {
-    exportBackground: boolean;
-    exportWithDarkMode: boolean;
-    exportScale: 1 | 2 | 3;
-  };
-  dirty: boolean;
+  onAPI: (api: ExcalidrawImperativeAPI) => void;
   onChange: (
-    elements: readonly any[],
+    elements: readonly ExcalidrawElement[],
     appState: Partial<AppState>,
-    files?: BinaryFiles
+    files: BinaryFiles
   ) => void;
 }) {
   const [excalidrawAPI, setExcalidrawAPI] = useState<ExcalidrawImperativeAPI>();
   const libraryItemsRef = useRef(props.libraryItems);
   const { theme, setThemeConfig } = useTheme(props.theme);
-  const [imageParams, setImageParams] = useState(props.imageParams);
   const [langCode, setLangCode] = useState(props.langCode);
 
   useEffect(() => {
-    if (!props.dirty) {
-      return;
-    }
-    if (props.initialData) {
-      const { elements, appState, files } = props.initialData;
-      props.onChange(elements || [], appState || {}, files);
-    } else {
-      props.onChange([], { viewBackgroundColor: "#ffffff" }, {});
-    }
-  }, []);
-
-  useEffect(() => {
-    const listener = async (e: any) => {
+    const listener = async (
+      e: MessageEvent<
+        | { type: "library-change"; library: string; merge: boolean }
+        | { type: "theme-change"; theme: string }
+        | { type: "language-change"; langCode: string }
+      >
+    ) => {
       try {
         const message = e.data;
         switch (message.type) {
@@ -134,9 +119,6 @@ export default function App(props: {
             setLangCode(message.langCode);
             break;
           }
-          case "image-params-change": {
-            setImageParams(message.imageParams);
-          }
         }
       } catch (e) {
         vscode.postMessage({
@@ -150,12 +132,15 @@ export default function App(props: {
     return () => {
       window.removeEventListener("message", listener);
     };
-  }, [excalidrawAPI]);
+  }, [excalidrawAPI, setThemeConfig]);
 
   return (
     <div className="excalidraw-wrapper">
       <Excalidraw
-        excalidrawAPI={(api) => setExcalidrawAPI(api)}
+        excalidrawAPI={(api) => {
+          setExcalidrawAPI(api);
+          props.onAPI(api);
+        }}
         UIOptions={{
           canvasActions: {
             loadScene: false,
@@ -173,11 +158,7 @@ export default function App(props: {
         }}
         libraryReturnUrl={"vscode://pomdtr.excalidraw-editor/importLib"}
         onChange={(elements, appState, files) =>
-          props.onChange(
-            elements,
-            { ...appState, ...imageParams, exportEmbedScene: true },
-            files
-          )
+          props.onChange(elements, appState, files)
         }
         onLinkOpen={(element, event) => {
           vscode.postMessage({
